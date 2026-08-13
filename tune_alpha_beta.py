@@ -64,9 +64,9 @@ parser.add_argument('--metric',     type=str,   default='acc',
                     help='Metric penentu ranking (berdasarkan OUT-SAMPLE): acc (maximize) | mae | rmse (minimize)')
 parser.add_argument('--noise_std',  type=float, default=0.00,  help='Noise std embedding (sama dengan main_mrmd.py)')
 parser.add_argument('--hid_dim',    type=int,   default=1024,  help='Hidden dim diffusion (sama dengan main_mrmd.py)')
-parser.add_argument('--epochs',     type=int,   default=10000, help='Epoch diffusion training')
-parser.add_argument('--max_iter',   type=int,   default=6,     help='Jumlah iterasi EM')
-parser.add_argument('--num_trials', type=int,   default=10,    help='Jumlah sampling imputasi')
+parser.add_argument('--epochs',     type=int,   default=10, help='Epoch diffusion training')
+parser.add_argument('--max_iter',   type=int,   default=1,     help='Jumlah iterasi EM')
+parser.add_argument('--num_trials', type=int,   default=1,    help='Jumlah sampling imputasi')
 parser.add_argument('--num_steps',  type=int,   default=50,    help='Jumlah diffusion steps')
 args = parser.parse_args()
 
@@ -107,8 +107,7 @@ print(f'{"="*60}\n')
 
 # ── Load dataset satu kali (MRmD + komponen dasar) ───────────────────────────
 print('[INFO] Loading dataset komponen dasar (MRmD discretization)...')
-# Load dari folder split dengan validation sebagai test
-dataname_for_load = f'{args.dataname}_split'
+# load_dataset sudah handle internal untuk load train/test dari folder split
 (train_X_default, test_X_default,
  ori_train_mask, ori_test_mask,
  train_num, test_num,
@@ -121,7 +120,7 @@ dataname_for_load = f'{args.dataname}_split'
  bin_midpoints,
  n_num_cols,
  t_mrmd, t_emb_default
-) = load_dataset(dataname_for_load, args.split_idx, mask_type, args.ratio, args.noise_std)
+) = load_dataset(args.dataname, args.split_idx, mask_type, args.ratio, args.noise_std)
 
 # ── Rekonstruksi komponen embedding dari load_dataset() ──────────────────────
 import pandas as pd, json
@@ -137,8 +136,8 @@ cat_col_idx    = info['cat_col_idx']
 target_col_idx = info['target_col_idx']
 
 data_df  = pd.read_csv(f'datasets/{args.dataname}/data.csv')
-train_df = pd.read_csv(f'datasets/{args.dataname}_split/train.csv')  # Load dari folder split
-test_df  = pd.read_csv(f'datasets/{args.dataname}_split/validation.csv')  # validation sebagai test
+train_df = pd.read_csv(f'datasets/{args.dataname}/{args.dataname}_validasi/train.csv')
+test_df  = pd.read_csv(f'datasets/{args.dataname}/{args.dataname}_validasi/validation.csv')
 cols     = train_df.columns
 
 train_y       = train_df[cols[target_col_idx]]

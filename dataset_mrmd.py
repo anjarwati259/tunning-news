@@ -748,10 +748,11 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     """
     ratio = str(ratio)
 
-    # Data original untuk MRmD discretization
+    # Data original untuk info dan data.csv
     data_dir  = f'datasets/{dataname}'
-    # Tapi train/test dari folder split (dengan validation sebagai test)
-    split_dir = f'datasets/{dataname}_split'
+    # Train/test dari folder split (dengan validation sebagai test)
+    split_dir = f'datasets/{dataname}/{dataname}_validasi'
+    # Info tetap dari original
     info_path = f'datasets/Info/{dataname}.json'
 
     with open(info_path, 'r') as f:
@@ -761,7 +762,7 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     cat_col_idx    = info['cat_col_idx']
     target_col_idx = info['target_col_idx']
 
-    # Data.csv dari original (untuk MRmD fitting)
+    # Data.csv dari original (untuk categorical encoding)
     data_path       = f'{data_dir}/data.csv'
     # Train/test dari folder split (validation sebagai test)
     train_path      = f'{split_dir}/train.csv'
