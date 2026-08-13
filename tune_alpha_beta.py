@@ -64,9 +64,9 @@ parser.add_argument('--metric',     type=str,   default='acc',
                     help='Metric penentu ranking (berdasarkan OUT-SAMPLE): acc (maximize) | mae | rmse (minimize)')
 parser.add_argument('--noise_std',  type=float, default=0.00,  help='Noise std embedding (sama dengan main_mrmd.py)')
 parser.add_argument('--hid_dim',    type=int,   default=1024,  help='Hidden dim diffusion (sama dengan main_mrmd.py)')
-parser.add_argument('--epochs',     type=int,   default=10, help='Epoch diffusion training')
-parser.add_argument('--max_iter',   type=int,   default=1,     help='Jumlah iterasi EM')
-parser.add_argument('--num_trials', type=int,   default=1,    help='Jumlah sampling imputasi')
+parser.add_argument('--epochs',     type=int,   default=10000, help='Epoch diffusion training')
+parser.add_argument('--max_iter',   type=int,   default=6,     help='Jumlah iterasi EM')
+parser.add_argument('--num_trials', type=int,   default=10,    help='Jumlah sampling imputasi')
 parser.add_argument('--num_steps',  type=int,   default=50,    help='Jumlah diffusion steps')
 args = parser.parse_args()
 
