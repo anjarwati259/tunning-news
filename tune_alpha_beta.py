@@ -80,8 +80,8 @@ device    = f'cuda:{args.gpu}'
 mask_type = 'MNAR_logistic_T2' if args.mask == 'MNAR' else args.mask
 
 # ── Grid Coarse ───────────────────────────────────────────────────────────────
-COARSE_ALPHA = [0.0]
-COARSE_BETA  = [0.0, 0.25]
+COARSE_ALPHA = [0.25]
+COARSE_BETA  = [0.0]
 
 # ── Import dari kode asli ─────────────────────────────────────────────────────
 import sys
