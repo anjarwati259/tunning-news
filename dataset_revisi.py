@@ -185,9 +185,6 @@ class MRmDDiscretizer(BaseEstimator, TransformerMixin):
             if missing_mask is not None:
                 observed_train_idx = train_idx[~missing_mask[train_idx, j]]
                 observed_val_idx   = val_idx[~missing_mask[val_idx, j]]
-                # Fallback: kalau kebetulan semua entri val untuk kolom ini
-                # missing, pakai train yang observed sebagai pengganti agar
-                # tidak crash (kasus langka, biasanya rate missing tidak 100%).
                 if len(observed_val_idx) == 0:
                     observed_val_idx = observed_train_idx
                 if len(observed_train_idx) == 0:
@@ -360,18 +357,32 @@ class SupervisedLearnableEmbeddingModel(nn.Module):
     """
     Model Supervised Learnable Embedding untuk fitur kategorikal tabular.
 
-    [TIDAK BERUBAH] — sama persis dengan versi sebelumnya.
     Sekarang juga dipakai untuk fitur numerik yang sudah di-diskritisasi MRmD.
+
+    [FIX LEAKAGE — Learnable Mask Vector]
+    Cardinality tiap fitur (embedding table, decoder) TETAP SAMA seperti
+    sebelumnya — TIDAK ada kategori/bin tambahan untuk "MISSING", supaya
+    makna bin/kategori asli tidak berubah dan decoder tidak perlu disesuaikan.
+    Sebagai gantinya, tiap fitur punya satu vektor `mask_embedding` yang
+    dipelajari (ukuran sama dengan embedding dimension fitur itu). Saat
+    encode() menerima `missing_mask`, embedding hasil lookup pada posisi
+    yang missing DIGANTI dengan mask_embedding tersebut — SEBELUM concat
+    dan SEBELUM masuk ke MLP. Dengan begitu, MLP (yang memproses seluruh
+    fitur secara bersamaan) tidak pernah menerima informasi dari nilai
+    asli pada posisi yang seharusnya disembunyikan.
 
     Alur (setelah penyesuaian arsitektur):
       cat_idx [batch, n_cols]          ← termasuk numerik yg sudah jadi bin index
-        → nn.Embedding per kolom → concat → [batch, total_emb_dim]
+        → nn.Embedding per kolom
+        → (jika missing_mask diberikan) ganti embedding kolom yang missing
+          dengan mask_embedding kolom tsb
+        → concat → [batch, total_emb_dim]
         → (opsional) Linear → SiLU → Linear   (1 hidden layer, jika use_mlp=True)
         → LayerNorm                            (stabilisasi skala sebelum diffusion)
         → z [batch, total_emb_dim]
         → MLP Classifier → [batch, n_classes]  (supervised signal, TETAP)
         → (+ noise σ=noise_std saat training)
-        → Linear Decoder per kolom → logits rekonstruksi
+        → Linear Decoder per kolom → logits rekonstruksi (dimensi TIDAK berubah)
     """
 
     def __init__(self, cat_dims: list, emb_sizes: list, n_classes: int,
@@ -383,6 +394,15 @@ class SupervisedLearnableEmbeddingModel(nn.Module):
         self.embeddings = nn.ModuleList([
             nn.Embedding(num_embeddings=n_cat, embedding_dim=emb_dim)
             for n_cat, emb_dim in zip(cat_dims, emb_sizes)
+        ])
+
+        # [FIX LEAKAGE] Satu vektor learnable per fitur untuk merepresentasikan
+        # "nilai ini sengaja tidak diketahui". Diinisialisasi kecil (seperti
+        # inisialisasi default nn.Embedding) supaya tidak mendominasi skala
+        # embedding di awal training.
+        self.mask_embeddings = nn.ParameterList([
+            nn.Parameter(torch.randn(emb_dim) * 0.01)
+            for emb_dim in emb_sizes
         ])
 
         self.total_emb_dim = sum(emb_sizes)
@@ -422,16 +442,34 @@ class SupervisedLearnableEmbeddingModel(nn.Module):
             for n_cat, emb_size in zip(cat_dims, emb_sizes)
         ])
 
-    def encode(self, x_cat: torch.Tensor) -> torch.Tensor:
+    def encode(self, x_cat: torch.Tensor, missing_mask: torch.Tensor = None) -> torch.Tensor:
         """
         Encode integer index → vektor embedding dense + LayerNorm.
-        x_cat  : [batch, n_cols]  — integer index tiap kolom
+        x_cat  : [batch, n_cols]  — integer index tiap kolom (nilai ASLI,
+                 termasuk di posisi yang missing — index-nya boleh apa saja
+                 karena hasil lookup-nya akan DIGANTI, bukan dipakai).
+        missing_mask : [batch, n_cols] bool, optional — True = posisi missing.
+                 [FIX LEAKAGE] Kalau diberikan, embedding hasil lookup pada
+                 posisi ini diganti dengan mask_embedding SEBELUM concat &
+                 MLP, sehingga MLP tidak pernah melihat informasi dari nilai
+                 asli di posisi tersebut.
         return : [batch, total_emb_dim]
         """
         embedded = [
             self.embeddings[i](x_cat[:, i])
             for i in range(self.n_cols)
         ]
+
+        if missing_mask is not None:
+            embedded_masked = []
+            for i in range(self.n_cols):
+                col_mask = missing_mask[:, i].unsqueeze(1)   # [batch, 1]
+                mask_vec = self.mask_embeddings[i].unsqueeze(0)  # [1, emb_dim_i]
+                # Ganti embedding hasil lookup dengan mask_vec di baris yang missing
+                col_emb = torch.where(col_mask, mask_vec, embedded[i])
+                embedded_masked.append(col_emb)
+            embedded = embedded_masked
+
         z = torch.cat(embedded, dim=1)
 
         if self.mlp is not None:
@@ -452,8 +490,9 @@ class SupervisedLearnableEmbeddingModel(nn.Module):
         per_col = torch.split(z, self.emb_sizes, dim=1)
         return [self.decoders[i](per_col[i]) for i in range(self.n_cols)]
 
-    def forward(self, x_cat: torch.Tensor, add_noise: bool = False):
-        z            = self.encode(x_cat)
+    def forward(self, x_cat: torch.Tensor, add_noise: bool = False,
+                missing_mask: torch.Tensor = None):
+        z            = self.encode(x_cat, missing_mask=missing_mask)
         class_logits = self.classify(z)
 
         if add_noise and self.training and self.noise_std > 0:
@@ -484,24 +523,45 @@ def train_supervised_embedding_model(cat_idx_array: np.ndarray,
                                      mlp_ratio: float = 1.5,
                                      noise_std: float = 0.01,
                                      patience: int = 30,
-                                     cat_idx_target: np.ndarray = None
+                                     missing_mask: np.ndarray = None,
+                                     random_mask_ratio: float = 0.0
                                      ) -> SupervisedLearnableEmbeddingModel:
     """
     Latih SupervisedLearnableEmbeddingModel.
 
-    [FIX LEAKAGE] `cat_idx_array` sekarang adalah versi INPUT yang posisi
-    missing-nya SUDAH diganti token "MISSING" (lihat build_masked_idx() di
-    load_dataset). `cat_idx_target` adalah nilai ASLI (sebelum diganti token)
-    yang dipakai HANYA sebagai target reconstruction loss — bukan sebagai
-    input encoder. Ini gaya training denoising-autoencoder: model belajar
-    menebak nilai asli dari input yang sudah disembunyikan, alih-alih
-    menghafal nilai asli yang justru ada di inputnya sendiri.
+    [FIX LEAKAGE — Learnable Mask Vector]
+    `cat_idx_array` tetap berisi index ASLI (termasuk di posisi missing —
+    nilainya tidak dipakai untuk posisi itu, hanya dipakai sebagai target
+    reconstruction loss). `missing_mask` [N, n_cols] bool menandai posisi
+    mana yang harus digantikan dengan mask_embedding di dalam encode().
+    Model belajar menebak nilai asli dari representasi yang sudah "ditutup"
+    di posisi missing (gaya denoising-autoencoder), bukan menghafal nilai
+    yang kebetulan ada di indeks input.
 
-    Kalau cat_idx_target None, dianggap sama dengan cat_idx_array (perilaku
-    lama, dipakai untuk kolom yang tidak mengalami missingness).
+    Kalau missing_mask None, berperilaku seperti sebelumnya (tidak ada
+    fitur yang mengalami missingness saat training — dipakai untuk kasus
+    tanpa missing value).
+
+    [RANDOM MASKING AUGMENTATION]
+    `random_mask_ratio` (0.0-1.0): proporsi entri OBSERVED (di luar
+    missing_mask asli) yang di-mask secara ACAK setiap batch/epoch selama
+    training, di atas mask asli. Tujuannya supaya model tidak hanya
+    terbiasa menebak satu pola missingness yang tetap (pola missing_mask
+    asli), tapi belajar menebak dari berbagai kombinasi fitur yang hilang
+    — gaya denoising-autoencoder/masked-pretraining (mirip BERT/MAE).
+    Pola random mask ini DIBUAT ULANG setiap batch (bukan sekali di awal),
+    sehingga tiap epoch model melihat variasi pola yang berbeda-beda.
+
+    Target reconstruction loss untuk entri yang di-random-mask TETAP nilai
+    aslinya (karena entri itu sebenarnya observed, cuma "disembunyikan
+    sementara" untuk keperluan augmentasi training) — bukan leakage, karena
+    ini hanya berlaku saat training embedding, TIDAK dipakai saat encode
+    final untuk train_all_emb/test_all_emb (yang hanya memakai missing_mask
+    asli, lihat load_dataset()).
+
+    random_mask_ratio=0.0 (default) → tidak ada augmentasi, perilaku sama
+    seperti sebelumnya.
     """
-    if cat_idx_target is None:
-        cat_idx_target = cat_idx_array
     # Fix random seed agar hasil embedding reproducible setiap run
     torch.manual_seed(42)
     np.random.seed(42)
@@ -520,12 +580,17 @@ def train_supervised_embedding_model(cat_idx_array: np.ndarray,
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     ce_loss   = nn.CrossEntropyLoss()
 
-    cat_tensor    = torch.tensor(cat_idx_array,  dtype=torch.long, device=device)  # INPUT (dengan token MISSING)
-    target_tensor = torch.tensor(cat_idx_target, dtype=torch.long, device=device)  # TARGET rekonstruksi (nilai asli)
-    label_tensor  = torch.tensor(labels, dtype=torch.long, device=device)
-    dataset       = torch.utils.data.TensorDataset(cat_tensor, target_tensor, label_tensor)
-    cpu_gen       = torch.Generator(device='cpu')
-    loader        = torch.utils.data.DataLoader(
+    cat_tensor   = torch.tensor(cat_idx_array, dtype=torch.long, device=device)
+    label_tensor = torch.tensor(labels, dtype=torch.long, device=device)
+
+    if missing_mask is not None:
+        mask_tensor = torch.tensor(missing_mask, dtype=torch.bool, device=device)
+        dataset     = torch.utils.data.TensorDataset(cat_tensor, label_tensor, mask_tensor)
+    else:
+        dataset     = torch.utils.data.TensorDataset(cat_tensor, label_tensor)
+
+    cpu_gen      = torch.Generator(device='cpu')
+    loader       = torch.utils.data.DataLoader(
         dataset,
         batch_size  = batch_size,
         shuffle     = True,
@@ -538,8 +603,8 @@ def train_supervised_embedding_model(cat_idx_array: np.ndarray,
     patience_counter = 0
     best_model_state = None
 
-    alpha = 0.7
-    beta  = 1.0
+    alpha = 1.0
+    beta  = 0.25
 
     model.train()
     for epoch in range(n_epochs):
@@ -548,17 +613,46 @@ def train_supervised_embedding_model(cat_idx_array: np.ndarray,
         total_recon_loss = 0.0
         n_batches        = 0
 
-        for batch_cat, batch_target, batch_labels in loader:
+        for batch in loader:
+            if missing_mask is not None:
+                batch_cat, batch_labels, batch_mask = batch
+            else:
+                batch_cat, batch_labels = batch
+                batch_mask = None
+
             optimizer.zero_grad()
 
-            # batch_cat   : input encoder — posisi missing sudah berisi token MISSING
-            # batch_target: nilai asli — dipakai HANYA sebagai target loss
-            z, class_logits, recon_logits = model(batch_cat, add_noise=True)
+            # [RANDOM MASKING AUGMENTATION] Bentuk random mask baru setiap
+            # batch (bukan sekali di awal), lalu gabungkan dengan mask asli
+            # via OR. Random mask HANYA diizinkan mengenai entri yang
+            # observed (di luar mask asli) — entri yang memang sudah missing
+            # tidak perlu di-random-mask lagi karena sudah pasti ter-mask.
+            if random_mask_ratio > 0:
+                extra_mask = (torch.rand_like(batch_cat, dtype=torch.float32)
+                              < random_mask_ratio)
+                if batch_mask is not None:
+                    extra_mask = extra_mask & (~batch_mask)   # jangan tumpuk di posisi yg sudah missing
+                    effective_mask = batch_mask | extra_mask
+                else:
+                    effective_mask = extra_mask
+            else:
+                effective_mask = batch_mask
+
+            # [FIX LEAKAGE] effective_mask diteruskan ke forward() supaya
+            # encode() mengganti embedding di posisi missing (asli + hasil
+            # augmentasi random) dengan mask_embedding, SEBELUM concat & MLP.
+            # batch_cat tetap dipakai sebagai target reconstruction loss
+            # (nilai asli) untuk SEMUA posisi, termasuk yang di-random-mask
+            # — karena entri itu sebenarnya observed, hanya disembunyikan
+            # sementara sebagai augmentasi.
+            z, class_logits, recon_logits = model(
+                batch_cat, add_noise=True, missing_mask=effective_mask
+            )
 
             class_loss = ce_loss(class_logits, batch_labels)
 
             recon_loss = sum(
-                ce_loss(recon_logits[i], batch_target[:, i])
+                ce_loss(recon_logits[i], batch_cat[:, i])
                 for i in range(model.n_cols)
             ) / model.n_cols
 
@@ -616,25 +710,35 @@ def train_supervised_embedding_model(cat_idx_array: np.ndarray,
 
 # ===========================================================================
 #  Encode / Decode helpers
-#  [FIX LEAKAGE] decode_cat_from_embedding & decode_num_from_embedding
-#  disesuaikan untuk mengecualikan token MISSING dari hasil prediksi.
-#  encode_with_embedding sendiri tidak berubah — yang berubah adalah ARRAY
-#  yang dipassing ke dalamnya (sekarang versi ber-token-MISSING, dibangun
-#  di load_dataset via build_masked_idx()).
+#  [FIX LEAKAGE] encode_with_embedding sekarang menerima missing_mask dan
+#  meneruskannya ke forward(), supaya embedding untuk train MAUPUN test
+#  dihitung dengan mask_embedding menggantikan nilai asli di posisi missing
+#  — bukan menghitung dari nilai asli lalu mask ditempel belakangan.
 # ===========================================================================
 
 def encode_with_embedding(model: SupervisedLearnableEmbeddingModel,
                           cat_idx_array: np.ndarray,
                           device: str,
-                          batch_size: int = 4096) -> np.ndarray:
+                          batch_size: int = 4096,
+                          missing_mask: np.ndarray = None) -> np.ndarray:
     """
     Encode integer index → embedding numpy array.
-    [TIDAK BERUBAH]
+
+    missing_mask : [N, n_cols] bool, optional — True = posisi missing.
+        [FIX LEAKAGE] Kalau diberikan, embedding pada posisi ini digantikan
+        dengan mask_embedding SEBELUM concat & MLP (lihat encode() pada
+        SupervisedLearnableEmbeddingModel).
     """
     model.eval()
     cat_tensor = torch.tensor(cat_idx_array, dtype=torch.long, device=device)
-    dataset    = torch.utils.data.TensorDataset(cat_tensor)
-    loader     = torch.utils.data.DataLoader(
+
+    if missing_mask is not None:
+        mask_tensor = torch.tensor(missing_mask, dtype=torch.bool, device=device)
+        dataset     = torch.utils.data.TensorDataset(cat_tensor, mask_tensor)
+    else:
+        dataset     = torch.utils.data.TensorDataset(cat_tensor)
+
+    loader = torch.utils.data.DataLoader(
         dataset,
         batch_size  = batch_size,
         shuffle     = False,
@@ -644,8 +748,13 @@ def encode_with_embedding(model: SupervisedLearnableEmbeddingModel,
 
     all_z = []
     with torch.no_grad():
-        for (batch,) in loader:
-            z, _, _ = model(batch, add_noise=False)
+        for batch in loader:
+            if missing_mask is not None:
+                batch_x, batch_mask = batch
+            else:
+                (batch_x,) = batch
+                batch_mask = None
+            z, _, _ = model(batch_x, add_noise=False, missing_mask=batch_mask)
             all_z.append(z.cpu().numpy())
 
     return np.concatenate(all_z, axis=0).astype(np.float32)
@@ -657,16 +766,11 @@ def decode_cat_from_embedding(model: SupervisedLearnableEmbeddingModel,
                               batch_size: int = 4096) -> np.ndarray:
     """
     Decode embedding → prediksi kelas tiap kolom (argmax logits).
-
-    [FIX LEAKAGE — penyesuaian] Tiap kolom sekarang punya 1 kelas ekstra
-    (token MISSING) di index TERAKHIR karena all_dims = cardinality asli + 1
-    (lihat load_dataset). Token ini HANYA dipakai untuk kebutuhan encoder
-    input, jadi tidak boleh ikut jadi hasil prediksi (tidak masuk akal
-    memprediksi "MISSING" sebagai jawaban imputasi). Karena itu logit kelas
-    terakhir dibuang sebelum argmax.
+    [TIDAK BERUBAH] — dipakai untuk kolom kategorikal (dan bisa juga untuk
+    numerik-bin jika diperlukan, tapi evaluasi numerik pakai bin_midpoints).
 
     emb_array : [N, total_emb_dim]
-    Return    : [N, n_cols]  — predicted integer index (di antara kategori asli)
+    Return    : [N, n_cols]  — predicted integer index
     """
     model.eval()
     emb_tensor = torch.tensor(emb_array, dtype=torch.float32, device=device)
@@ -684,8 +788,7 @@ def decode_cat_from_embedding(model: SupervisedLearnableEmbeddingModel,
         for (batch,) in loader:
             recon_logits = model.decode(batch)
             pred_idx = torch.stack([
-                # buang logit kelas terakhir (token MISSING) sebelum argmax
-                torch.argmax(logits[:, :-1], dim=1)
+                torch.argmax(logits, dim=1)
                 for logits in recon_logits
             ], dim=1)
             all_pred.append(pred_idx.cpu().numpy())
@@ -742,11 +845,7 @@ def decode_num_from_embedding(model: SupervisedLearnableEmbeddingModel,
 
             batch_num_preds = []
             for col in range(n_num_cols):
-                # [FIX LEAKAGE — penyesuaian] logits punya n_bins_col + 1 kelas
-                # (kelas terakhir = token MISSING). Buang sebelum softmax supaya
-                # weighted-sum hanya memakai bin asli & dimensinya cocok dengan
-                # bin_midpoints (panjang n_bins_col, tanpa token MISSING).
-                logits  = recon_logits[col][:, :-1]                   # [B, n_bins_col]
+                logits  = recon_logits[col]                          # [B, n_bins_col]
                 probs   = torch.softmax(logits, dim=1)               # [B, n_bins_col]
                 mids_t  = torch.tensor(
                     bin_midpoints[col], dtype=torch.float32, device=device
@@ -766,7 +865,8 @@ def decode_num_from_embedding(model: SupervisedLearnableEmbeddingModel,
 #  Load Dataset
 # ===========================================================================
 
-def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
+def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01,
+                 random_mask_ratio=0.15):
     """
     Load dataset dengan MRmD discretization untuk numerik +
     Supervised Embedding untuk SEMUA kolom (numerik-bin + kategorikal).
@@ -777,6 +877,14 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     - Pipeline embedding → normalisasi → diffusion → imputasi TIDAK BERUBAH
     - train_num / test_num tetap dikembalikan (nilai float asli, ternormalisasi)
       untuk keperluan evaluasi MAE/RMSE di skala normalisasi
+
+    [RANDOM MASKING AUGMENTATION]
+    random_mask_ratio : float, default 0.15
+        Proporsi entri observed yang di-random-mask (di atas mask asli)
+        setiap batch selama TRAINING embedding model saja — lihat detail di
+        docstring train_supervised_embedding_model(). Tidak memengaruhi
+        encode_with_embedding() untuk train_all_emb/test_all_emb final,
+        yang hanya memakai missing_mask asli. Set 0.0 untuk menonaktifkan.
 
     Output tambahan (dibanding versi sebelumnya):
     - mrmd          : MRmDDiscretizer  (untuk transform test & decode)
@@ -856,9 +964,9 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     # ── [FIX LEAKAGE] Missingness mask per subset, dihitung DI AWAL ────────
     # mask asli: True(1) = entri sengaja dibuat missing untuk task imputasi.
     # Dipakai untuk (a) mengecualikan entri missing dari MRmD fit, dan
-    # (b) mengganti entri missing dengan token "MISSING" sebelum masuk ke
-    # embedding encoder — supaya encoder tidak pernah melihat nilai asli
-    # di posisi yang seharusnya diimputasi.
+    # (b) menentukan posisi mana yang harus digantikan mask_embedding di
+    # dalam encode() — supaya encoder tidak pernah "melihat" nilai asli di
+    # posisi yang seharusnya diimputasi.
     n_num_cols = len(num_col_idx)
     train_num_mask_bool = train_mask[:, num_col_idx].astype(bool) if n_num_cols > 0 else np.zeros((len(train_df), 0), dtype=bool)
     test_num_mask_bool  = test_mask[:,  num_col_idx].astype(bool) if n_num_cols > 0 else np.zeros((len(test_df),  0), dtype=bool)
@@ -887,24 +995,18 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
         test_num  = test_num_norm.astype(np.float32)
 
         # ── MRmD Discretization (dengan cache) ──────────────────────────
-        # [FIX LEAKAGE] Nama cache diganti (mrmd_v2_noleak) supaya TIDAK
-        # ikut memuat cache lama yang dihasilkan dari fit() versi leaky
-        # (yang memakai entri missing). Kalau kamu sudah pernah menjalankan
-        # versi lama, cache lama di cache/{dataname}/mrmd.pkl aman diabaikan
-        # / dihapus manual.
-        mrmd_cache_path = f'cache/{dataname}/mrmd_v2_noleak_rate{ratio}_{mask_type}_{idx}.pkl'
+        # [FIX LEAKAGE] Nama cache diganti (mrmd_v3_maskvec) supaya TIDAK
+        # ikut memuat cache lama yang dihasilkan dari fit() versi leaky.
+        mrmd_cache_path = f'cache/{dataname}/mrmd_v3_maskvec_rate{ratio}_{mask_type}_{idx}.pkl'
         os.makedirs(f'cache/{dataname}', exist_ok=True)
 
         if os.path.exists(mrmd_cache_path):
-            # Load cut points dari cache, skip fitting
             print(f'[MRmD] Cache ditemukan di {mrmd_cache_path}, skip fitting.')
             with open(mrmd_cache_path, 'rb') as f:
                 mrmd = pickle.load(f)
             t_mrmd = 0.0
             print(f'[MRmD] Cut points di-load. n_bins per kolom: {mrmd.n_bins_}')
         else:
-            # Fit MRmD pada data RAW train (bukan normalisasi) dengan label,
-            # MENGECUALIKAN entri yang di-mask sebagai missing.
             print(f'[MRmD] Cache belum ada. Menjalankan MRmD discretization '
                   f'pada {n_num_cols} kolom numerik (entri missing dikecualikan) ...')
             t_mrmd_start = time.time()
@@ -971,9 +1073,6 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
 
     # ── Gabungkan: [num_bin | cat_idx] → satu array idx untuk embedding ──
     # Urutan: numerik (bin) DULU, lalu kategorikal — konsisten di seluruh pipeline
-    # train_all_idx / test_all_idx = NILAI ASLI (true bin/kategori), dipakai
-    # sebagai ground truth evaluasi (truth_all_idx). JANGAN dipakai langsung
-    # sebagai input encoder — lihat train_all_idx_input di bawah.
     if n_num_cols > 0 and len(cat_col_idx) > 0:
         train_all_idx = np.concatenate([train_num_bin, train_cat_idx], axis=1)
         test_all_idx  = np.concatenate([test_num_bin,  test_cat_idx],  axis=1)
@@ -984,7 +1083,8 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
         train_all_idx = train_cat_idx
         test_all_idx  = test_cat_idx
 
-    # Mask gabungan [num_mask | cat_mask], urutan sama dengan train_all_idx
+    # Mask gabungan [num_mask | cat_mask], urutan sama dengan train_all_idx.
+    # Dipakai untuk (a) input training embedding, (b) encoding train & test.
     if n_num_cols > 0 and len(cat_col_idx) > 0:
         train_all_mask_bool = np.concatenate([train_num_mask_bool, train_cat_mask_bool], axis=1)
         test_all_mask_bool  = np.concatenate([test_num_mask_bool,  test_cat_mask_bool],  axis=1)
@@ -996,63 +1096,44 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
         test_all_mask_bool  = test_cat_mask_bool
 
     # ── Dimensi embedding ─────────────────────────────────────────────────
-    # Numerik: n_bins per kolom; kategorikal: n_unique per kolom
-    # [FIX LEAKAGE] +1 kategori tambahan per kolom untuk token "MISSING".
-    # Token MISSING selalu berada di index TERAKHIR (== cardinality asli).
-    all_dims_original = (mrmd.n_bins_ if mrmd is not None else []) + cat_dims_cat
-    all_dims  = [n + 1 for n in all_dims_original]     # +1 slot token MISSING
-    missing_token_idx = np.array(all_dims_original, dtype=np.int64)  # index token MISSING per kolom
+    # Numerik: n_bins per kolom; kategorikal: n_unique per kolom.
+    # [FIX LEAKAGE — Learnable Mask Vector] TIDAK ada +1 di sini. Cardinality
+    # tetap murni cardinality asli — makna bin/kategori tidak berubah.
+    all_dims = (mrmd.n_bins_ if mrmd is not None else []) + cat_dims_cat
     emb_sizes = [compute_embedding_size(n) for n in all_dims]
 
-    print(f'[Embedding] all_dims_original (num_bin+cat)={all_dims_original}')
-    print(f'[Embedding] all_dims (+1 token MISSING)={all_dims}')
+    print(f'[Embedding] all_dims (num_bin+cat)={all_dims}')
     print(f'[Embedding] emb_sizes={emb_sizes}, total_emb_dim={sum(emb_sizes)}')
-
-    def build_masked_idx(idx_true: np.ndarray, mask_bool: np.ndarray) -> np.ndarray:
-        """
-        [FIX LEAKAGE] Ganti entri yang di-mask (mask_bool==True) dengan token
-        MISSING kolom tersebut. Hasil array inilah yang boleh dimasukkan ke
-        encoder — idx_true (nilai asli) TIDAK BOLEH dipakai sebagai input
-        untuk kolom manapun yang punya entri missing, karena akan bocor lewat
-        MLP di encode() yang mencampur seluruh kolom sebelum mask diterapkan.
-        """
-        idx_input = idx_true.copy()
-        for j in range(idx_true.shape[1]):
-            idx_input[mask_bool[:, j], j] = missing_token_idx[j]
-        return idx_input
-
-    train_all_idx_input = build_masked_idx(train_all_idx, train_all_mask_bool)
-    test_all_idx_input  = build_masked_idx(test_all_idx,  test_all_mask_bool)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # ── Latih SupervisedLearnableEmbeddingModel ───────────────────────────
-    # [FIX LEAKAGE] Input encoder = train_all_idx_input (token MISSING di
-    # posisi yang missing). Target reconstruction loss = train_all_idx
-    # (nilai asli) — gaya denoising-autoencoder: model belajar menebak nilai
-    # asli dari input yang sudah "ditutup", bukan menghafal nilai yang
-    # kebetulan ada di inputnya sendiri.
+    # [FIX LEAKAGE — Learnable Mask Vector] missing_mask diteruskan supaya
+    # encode() mengganti embedding di posisi missing dengan mask_embedding
+    # SEBELUM concat & MLP. Input index (train_all_idx) tetap nilai asli
+    # karena juga dipakai sebagai target reconstruction loss.
     print('[Embedding] Melatih SupervisedLearnableEmbeddingModel '
-          '(classification + reconstruction loss, input sudah di-mask) ...')
+          '(classification + reconstruction loss, mask-vector di posisi missing) ...')
     t_emb_start = time.time()
     print(noise_std)
     emb_model = train_supervised_embedding_model(
-        cat_idx_array  = train_all_idx_input,
-        cat_idx_target = train_all_idx,
-        labels         = train_labels,
-        cat_dims       = all_dims,
-        emb_sizes      = emb_sizes,
-        n_classes      = n_classes,
-        device         = device,
-        n_epochs       = 1000,
-        batch_size     = 1024,
-        lr             = 1e-3,
-        dropout        = 0.1,
-        hidden_dim     = 256,
-        use_mlp        = True,
-        mlp_ratio      = 1.5,
-        noise_std      = noise_std,
-        patience       = 40,
+        cat_idx_array = train_all_idx,
+        labels        = train_labels,
+        cat_dims      = all_dims,
+        emb_sizes     = emb_sizes,
+        n_classes     = n_classes,
+        device        = device,
+        n_epochs      = 1000,
+        batch_size    = 1024,
+        lr            = 1e-3,
+        dropout       = 0.1,
+        hidden_dim    = 256,
+        use_mlp       = True,
+        mlp_ratio     = 1.5,
+        noise_std     = noise_std,
+        patience      = 40,
+        missing_mask  = train_all_mask_bool,
+        random_mask_ratio = random_mask_ratio,
     )
     t_emb_end = time.time()
     t_emb = t_emb_end - t_emb_start
@@ -1060,11 +1141,13 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     print(f'[Embedding] Waktu komputasi embedding: {t_emb:.4f}s')
 
     # ── Encode semua kolom → embedding vector ────────────────────────────
-    # [FIX LEAKAGE] Encode pakai versi INPUT (token MISSING), bukan nilai
-    # asli. Ini berlaku untuk train MAUPUN test — encoder tidak pernah
-    # melihat nilai asli di posisi yang seharusnya diimputasi.
-    train_all_emb = encode_with_embedding(emb_model, train_all_idx_input, device)
-    test_all_emb  = encode_with_embedding(emb_model, test_all_idx_input,  device)
+    # [FIX LEAKAGE] missing_mask diteruskan untuk train MAUPUN test, supaya
+    # encoder tidak pernah melihat nilai asli di posisi yang seharusnya
+    # diimputasi — diganti mask_embedding di dalam encode().
+    train_all_emb = encode_with_embedding(emb_model, train_all_idx, device,
+                                          missing_mask=train_all_mask_bool)
+    test_all_emb  = encode_with_embedding(emb_model, test_all_idx,  device,
+                                          missing_mask=test_all_mask_bool)
     # shape: [N, total_emb_dim]
 
     # ── train_X / test_X sekarang HANYA embedding (tidak ada kolom raw num) ─
@@ -1075,9 +1158,7 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     # ── Buat extended mask ────────────────────────────────────────────────
     # Mask asli: [N, total_original_cols]
     # Extended mask: [N, total_emb_dim] — diperluas sesuai emb_sizes
-    # (sudah dihitung di awal fungsi sebagai train_all_mask_bool/test_all_mask_bool,
-    #  dipakai ulang di sini supaya konsisten dengan mask yang dipakai untuk
-    #  membangun train_all_idx_input/test_all_idx_input)
+    # (sudah dihitung sebelumnya sebagai train_all_mask_bool/test_all_mask_bool)
     train_all_mask = train_all_mask_bool
     test_all_mask  = test_all_mask_bool
 
