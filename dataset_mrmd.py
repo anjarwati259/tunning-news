@@ -293,7 +293,8 @@ class MRmDDiscretizer(BaseEstimator, TransformerMixin):
         return np.array(self.n_bins_)
 
     def get_bin_midpoints(self, X_norm: np.ndarray,
-                          X_norm_binned: np.ndarray) -> list:
+                          X_norm_binned: np.ndarray,
+                          missing_mask: np.ndarray = None) -> list:
         """
         Hitung nilai tengah (midpoint) setiap bin dalam skala normalisasi.
 
@@ -301,23 +302,43 @@ class MRmDDiscretizer(BaseEstimator, TransformerMixin):
 
         X_norm        : [N, n_cols]  — data normalisasi (skala (X-mean)/std)
         X_norm_binned : [N, n_cols]  — hasil transform (integer bin index)
+        missing_mask  : [N, n_cols] bool, opsional — True = nilai HILANG (missing).
+                        [FIX - LEAKAGE] Jika diberikan, baris yang di-mask missing
+                        DIKECUALIKAN dari perhitungan midpoint per kolom, agar
+                        midpoint (yang jadi acuan skor MAE/RMSE saat evaluasi)
+                        tidak dihitung dari nilai asli di posisi yang seharusnya
+                        diimputasi / tidak diketahui.
 
         Return : list[n_cols] of np.ndarray, tiap elemen panjang n_bins_[col]
         """
         n_cols    = X_norm.shape[1]
         midpoints = []
 
+        if missing_mask is not None:
+            missing_mask = np.array(missing_mask, dtype=bool)
+
         for col in range(n_cols):
             n_bins = self.n_bins_[col]
             mids   = np.zeros(n_bins, dtype=np.float32)
 
+            if missing_mask is not None:
+                obs_col = ~missing_mask[:, col]
+            else:
+                obs_col = np.ones(X_norm.shape[0], dtype=bool)
+
             for b in range(n_bins):
-                mask = X_norm_binned[:, col] == b
+                mask = (X_norm_binned[:, col] == b) & obs_col
                 if mask.sum() > 0:
                     mids[b] = float(X_norm[mask, col].mean())
                 else:
-                    # Bin kosong → interpolasi linear
-                    mids[b] = float(b) / max(n_bins - 1, 1)
+                    # Bin kosong (setelah exclude missing) → fallback ke
+                    # semua baris di bin tsb (walau termasuk missing), dan
+                    # jika tetap kosong, interpolasi linear.
+                    mask_all = (X_norm_binned[:, col] == b)
+                    if mask_all.sum() > 0:
+                        mids[b] = float(X_norm[mask_all, col].mean())
+                    else:
+                        mids[b] = float(b) / max(n_bins - 1, 1)
 
             midpoints.append(mids)
 
@@ -957,7 +978,12 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
 
         # Hitung bin midpoints dalam skala NORMALISASI
         # (dipakai saat decoding: bin index → nilai kontinu untuk MAE/RMSE)
-        bin_midpoints = mrmd.get_bin_midpoints(train_num_norm, train_num_bin)
+        # [FIX - LEAKAGE] Sertakan num_mask_train agar baris yang di-mask
+        # missing tidak ikut menyumbang ke rata-rata midpoint bin — kalau
+        # tidak, nilai asli di posisi yang mau diimputasi bisa "bocor" ke
+        # midpoint yang justru dipakai sebagai acuan skor MAE/RMSE.
+        bin_midpoints = mrmd.get_bin_midpoints(train_num_norm, train_num_bin,
+                                               missing_mask=num_mask_train)
 
         print(f'[MRmD] n_bins per kolom: {mrmd.n_bins_}')
         print(f'[MRmD] Total bins: {sum(mrmd.n_bins_)}')
