@@ -1,3 +1,27 @@
+# =============================================================================
+# [FIX LEAKAGE — Learnable Mask Vector] Sebelum menjalankan skrip ini dengan
+# dataset_mrmd.py versi revisi, PASTIKAN direktori berikut untuk dataset yang
+# mau kamu jalankan ulang dalam kondisi bersih (hapus jika berisi hasil dari
+# versi lama/leaky):
+#   - cache/{dataname}/                (cache MRmD lama; nama file MRmD cache
+#                                        sudah diganti jadi mrmd_leakfix.pkl,
+#                                        jadi otomatis tidak akan ke-load, tapi
+#                                        tetap aman dihapus)
+#   - ckpt/{dataname}/rate{ratio}/{mask_type}/{split_idx}/...   (checkpoint
+#                                        diffusion lama, dilatih dari embedding
+#                                        yang leaky)
+#   - results/{dataname}/rate{ratio}/{mask_type}/{split_idx}/... (file hasil
+#                                        lama; skrip ini APPEND ('a+') ke
+#                                        file hasil)
+#
+# CATATAN TAMBAHAN (di luar isu leakage): cache MRmD (mrmd_leakfix.pkl) tidak
+# menyertakan ratio/mask_type/split_idx di namanya — artinya kalau kamu
+# menjalankan beberapa kombinasi missing ratio/mekanisme berbeda untuk
+# dataset yang sama, cache akan collide (dipakai bersama padahal seharusnya
+# beda cut point per skenario). Ini bug terpisah dari isu leakage; kalau mau
+# aman, hapus folder cache/{dataname}/ setiap kali ganti ratio atau mask_type.
+# =============================================================================
+
 import os
 import torch
 
@@ -21,11 +45,11 @@ parser = argparse.ArgumentParser(description='Missing Value Imputation')
 parser.add_argument('--dataname',   type=str, default='california', help='Name of dataset.')
 parser.add_argument('--gpu',        type=int, default=0,            help='GPU index.')
 parser.add_argument('--split_idx',  type=int, default=0,            help='Split idx.')
-parser.add_argument('--max_iter',   type=int, default=5,            help='Maximum iteration.')
+parser.add_argument('--max_iter',   type=int, default=6,            help='Maximum iteration.')
 parser.add_argument('--ratio',      type=str, default=30,           help='Masking ratio.')
 parser.add_argument('--hid_dim',    type=int, default=1024,         help='Hidden dimension.')
 parser.add_argument('--mask',       type=str, default='MCAR',       help='Masking mechanism.')
-parser.add_argument('--num_trials', type=int, default=2,            help='Number of sampling times.')
+parser.add_argument('--num_trials', type=int, default=10,            help='Number of sampling times.')
 parser.add_argument('--num_steps',  type=int, default=50,           help='Number of diffusion steps.')
 parser.add_argument('--noise_std',  type=float, default=0.05,       help='Noise std for embedding model.')
 parser.add_argument('--epochs',     type=int, default=100,        help='Number of training epochs per iteration.')
