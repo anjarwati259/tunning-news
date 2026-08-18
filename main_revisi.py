@@ -1,19 +1,18 @@
 # =============================================================================
-# [FIX LEAKAGE] Sebelum menjalankan skrip ini dengan dataset_mrmd.py versi
-# revisi, PASTIKAN direktori berikut untuk dataset yang mau kamu jalankan
-# ulang dalam kondisi bersih (hapus jika berisi hasil dari versi lama/leaky):
+# [FIX LEAKAGE — Learnable Mask Vector] Sebelum menjalankan skrip ini dengan
+# dataset_mrmd.py versi revisi, PASTIKAN direktori berikut untuk dataset yang
+# mau kamu jalankan ulang dalam kondisi bersih (hapus jika berisi hasil dari
+# versi lama/leaky):
 #   - cache/{dataname}/                (cache MRmD lama; nama file MRmD cache
-#                                        sudah diganti jadi mrmd_v2_noleak_*,
-#                                        jadi ini sebenarnya otomatis tidak
-#                                        akan ke-load, tapi tetap aman dihapus)
+#                                        sudah diganti jadi mrmd_v3_maskvec_*,
+#                                        jadi otomatis tidak akan ke-load, tapi
+#                                        tetap aman dihapus)
 #   - ckpt/{dataname}/rate{ratio}/{mask_type}/{split_idx}/...   (checkpoint
 #                                        diffusion lama, dilatih dari embedding
 #                                        yang leaky)
 #   - results/{dataname}/rate{ratio}/{mask_type}/{split_idx}/... (file hasil
 #                                        lama; skrip ini APPEND ('a+') ke
-#                                        result_mrmdwith.txt, jadi kalau tidak
-#                                        dihapus, hasil lama & baru akan
-#                                        tercampur di file yang sama)
+#                                        result_mrmdwith.txt)
 # =============================================================================
 
 import os
@@ -28,7 +27,7 @@ import time
 from tqdm import tqdm
 
 from model import MLPDiffusion, Model
-from dataset_revisi import (load_dataset, get_eval, mean_std,
+from dataset_mrmd import (load_dataset, get_eval, mean_std,
                      decode_cat_from_embedding)
 from diffusion_utils import sample_step, impute_mask
 
@@ -217,7 +216,7 @@ if __name__ == '__main__':
 
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
         scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.9,
-                                      patience=50)
+                                      patience=50, verbose=False)
 
         model.train()
         best_loss = float('inf')
