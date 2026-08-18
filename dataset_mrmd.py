@@ -139,11 +139,10 @@ class MRmDDiscretizer(BaseEstimator, TransformerMixin):
         Fit MRmD: temukan cut point optimal untuk tiap fitur.
         X    : [N, n_cols] float — fitur numerik
         y    : [N]         int   — label kelas
-        mask : [N, n_cols] bool, opsional — True = nilai HILANG (missing).
-               [FIX - LEAKAGE] Jika diberikan, posisi missing DIKECUALIKAN
-               dari proses fitting (split train/val internal, perhitungan
-               cut point, MI, JS-divergence) per kolom, agar MRmD tidak
-               "melihat" nilai yang seharusnya diimputasi.
+        mask : [N, n_cols] bool, opsional — True = MISSING (tidak dipakai fitting).
+               [FIX LEAKAGE] Jika diberikan, setiap kolom hanya fit dari baris
+               yang OBSERVED pada kolom itu. Baris missing tidak pernah ikut
+               menentukan cut point / MI / JS-Divergence.
         """
         if hasattr(X, 'columns'):
             self.feature_names_in_ = np.array(X.columns)
@@ -157,23 +156,13 @@ class MRmDDiscretizer(BaseEstimator, TransformerMixin):
 
         if mask is not None:
             mask = np.array(mask, dtype=bool)
+            assert mask.shape == X.shape, 'mask harus sama shape dengan X'
 
-        # Split internal: training vs validation
-        rng       = np.random.RandomState(self.random_state)
-        val_n     = max(1, int(n_samples * self.val_size))
-        val_idx   = rng.choice(n_samples, size=val_n, replace=False)
-        train_idx = np.setdiff1d(np.arange(n_samples), val_idx)
-
-        X_tr, y_tr = X[train_idx], y[train_idx]
-        X_vl       = X[val_idx]
-
-        if mask is not None:
-            mask_tr = mask[train_idx]
-            mask_vl = mask[val_idx]
+        rng = np.random.RandomState(self.random_state)
 
         if self.verbose:
-            print(f'[MRmD] n_train={len(train_idx)}, n_val={len(val_idx)}, '
-                  f'n_features={n_features}')
+            print(f'[MRmD] n_samples_total={n_samples}, n_features={n_features}, '
+                  f'observed-only fit={mask is not None}')
 
         self.cut_points_ = []
         self.x_min_      = []
@@ -182,45 +171,61 @@ class MRmDDiscretizer(BaseEstimator, TransformerMixin):
         self.n_bins_     = []
 
         for j in range(n_features):
-            x_tr_j = X_tr[:, j]
-            x_vl_j = X_vl[:, j]
-            y_tr_j = y_tr
-
-            # [FIX - LEAKAGE] Kecualikan posisi missing (per kolom) dari
-            # data yang dipakai untuk fitting, agar cut point tidak
-            # dihitung dari nilai yang seharusnya "tidak diketahui".
+            # ── [FIX LEAKAGE] Ambil hanya baris observed utk kolom ini ──────
             if mask is not None:
-                obs_tr_j = ~mask_tr[:, j]
-                obs_vl_j = ~mask_vl[:, j]
-                if obs_tr_j.sum() == 0:
-                    # Fallback: jika seluruh train observed kosong (kasus ekstrem),
-                    # tetap pakai semua data agar tidak error.
-                    obs_tr_j = np.ones_like(obs_tr_j, dtype=bool)
-                if obs_vl_j.sum() == 0:
-                    obs_vl_j = np.ones_like(obs_vl_j, dtype=bool)
-                x_tr_j = x_tr_j[obs_tr_j]
-                x_vl_j = x_vl_j[obs_vl_j]
-                y_tr_j = y_tr[obs_tr_j]
+                obs_j = ~mask[:, j]
+            else:
+                obs_j = np.ones(n_samples, dtype=bool)
 
-            x_min = float(x_tr_j.min())
-            x_max = float(x_tr_j.max())
+            X_j = X[obs_j, j]
+            y_j = y[obs_j]
+            n_obs = len(X_j)
+
+            if n_obs == 0:
+                # Seluruh kolom missing → tidak bisa fit, fallback 1 bin
+                self.cut_points_.append(np.array([]))
+                self.x_min_.append(0.0)
+                self.x_max_.append(1.0)
+                self.n_bins_.append(1)
+                if self.verbose:
+                    print(f'  [MRmD] Col {j}: semua observed=0, skip (fallback 1 bin).')
+                continue
+
+            # Split internal train/val HANYA dari subset observed kolom ini
+            val_n = max(1, int(n_obs * self.val_size))
+            val_n = min(val_n, max(n_obs - 1, 1))
+            if n_obs > 1:
+                val_idx_j   = rng.choice(n_obs, size=val_n, replace=False)
+                train_idx_j = np.setdiff1d(np.arange(n_obs), val_idx_j)
+                if len(train_idx_j) == 0:
+                    train_idx_j = val_idx_j
+            else:
+                val_idx_j   = np.array([0])
+                train_idx_j = np.array([0])
+
+            x_tr = X_j[train_idx_j]
+            x_vl = X_j[val_idx_j]
+            c_tr = y_j[train_idx_j]
+
+            x_min = float(x_tr.min())
+            x_max = float(x_tr.max())
             self.x_min_.append(x_min)
             self.x_max_.append(x_max)
 
-            unique_tr = np.unique(x_tr_j)
+            unique_tr = np.unique(x_tr)
             if len(unique_tr) <= 1:
                 self.cut_points_.append(np.array([]))
                 self.n_bins_.append(1)
                 if self.verbose:
-                    print(f'  [MRmD] Col {j}: konstan, skip.')
+                    print(f'  [MRmD] Col {j}: konstan (observed), skip.')
                 continue
 
-            cp = self._fit_one_attribute(x_tr_j, x_vl_j, y_tr_j,
+            cp = self._fit_one_attribute(x_tr, x_vl, c_tr,
                                          unique_tr, x_min, x_max, j)
             self.cut_points_.append(cp)
             n_bins = len(cp) + 1
             self.n_bins_.append(n_bins)
-            print(f'  [MRmD] Col {j}: {len(cp)} cut points → {n_bins} bins')
+            print(f'  [MRmD] Col {j}: n_obs={n_obs}, {len(cp)} cut points → {n_bins} bins')
 
         return self
 
@@ -293,7 +298,8 @@ class MRmDDiscretizer(BaseEstimator, TransformerMixin):
         return np.array(self.n_bins_)
 
     def get_bin_midpoints(self, X_norm: np.ndarray,
-                          X_norm_binned: np.ndarray) -> list:
+                          X_norm_binned: np.ndarray,
+                          mask: np.ndarray = None) -> list:
         """
         Hitung nilai tengah (midpoint) setiap bin dalam skala normalisasi.
 
@@ -301,6 +307,10 @@ class MRmDDiscretizer(BaseEstimator, TransformerMixin):
 
         X_norm        : [N, n_cols]  — data normalisasi (skala (X-mean)/std)
         X_norm_binned : [N, n_cols]  — hasil transform (integer bin index)
+        mask          : [N, n_cols] bool, opsional — True = MISSING.
+                        [FIX LEAKAGE] Jika diberikan, baris missing tidak ikut
+                        dihitung ke rata-rata midpoint bin (supaya nilai asli
+                        di posisi missing tidak bocor lewat lookup table ini).
 
         Return : list[n_cols] of np.ndarray, tiap elemen panjang n_bins_[col]
         """
@@ -311,12 +321,14 @@ class MRmDDiscretizer(BaseEstimator, TransformerMixin):
             n_bins = self.n_bins_[col]
             mids   = np.zeros(n_bins, dtype=np.float32)
 
+            obs_col = (~mask[:, col]) if mask is not None else np.ones(X_norm.shape[0], dtype=bool)
+
             for b in range(n_bins):
-                mask = X_norm_binned[:, col] == b
-                if mask.sum() > 0:
-                    mids[b] = float(X_norm[mask, col].mean())
+                bin_mask = (X_norm_binned[:, col] == b) & obs_col
+                if bin_mask.sum() > 0:
+                    mids[b] = float(X_norm[bin_mask, col].mean())
                 else:
-                    # Bin kosong → interpolasi linear
+                    # Bin kosong (di data observed) → interpolasi linear
                     mids[b] = float(b) / max(n_bins - 1, 1)
 
             midpoints.append(mids)
@@ -475,6 +487,7 @@ def train_supervised_embedding_model(cat_idx_array: np.ndarray,
                                      emb_sizes: list,
                                      n_classes: int,
                                      device: str,
+                                     obs_mask: np.ndarray = None,
                                      n_epochs: int = 50,
                                      batch_size: int = 1024,
                                      lr: float = 1e-3,
@@ -483,17 +496,22 @@ def train_supervised_embedding_model(cat_idx_array: np.ndarray,
                                      use_mlp: bool = True,
                                      mlp_ratio: float = 1.5,
                                      noise_std: float = 0.01,
-                                     patience: int = 30,
-                                     mask_array: np.ndarray = None) -> SupervisedLearnableEmbeddingModel:
+                                     patience: int = 30) -> SupervisedLearnableEmbeddingModel:
     """
     Latih SupervisedLearnableEmbeddingModel.
     Sekarang cat_idx_array berisi SEMUA kolom (numerik bin + kategorikal).
 
-    mask_array : [N, n_cols] bool, opsional — True = nilai HILANG (missing).
-        [FIX - LEAKAGE] Jika diberikan, posisi missing DIKECUALIKAN dari
-        reconstruction loss per kolom, agar embedding tidak "menghafal"
-        nilai asli di posisi yang seharusnya diimputasi (yang nanti dipakai
-        sebagai ground-truth evaluasi in-sample).
+    [FIX LEAKAGE]
+    - cat_idx_array yang di-pass ke sini HARUS sudah memakai token "missing"
+      khusus (bukan nilai asli) di posisi yang ditandai missing pada mask asli.
+      Model tidak pernah melihat nilai asli di posisi missing sebagai input.
+    - obs_mask : [N, n_cols] bool, True = observed. Jika diberikan,
+      reconstruction loss per kolom HANYA dihitung pada entri observed —
+      supaya model tidak "belajar" mereproduksi token missing (target yang
+      tidak informatif) dan tidak ada sinyal dari nilai yang seharusnya
+      tidak diketahui yang menyelinap ke loss.
+      Classification loss tetap dihitung dari seluruh baris seperti biasa
+      (labelnya bukan bagian dari fitur yang di-mask).
     """
     # Fix random seed agar hasil embedding reproducible setiap run
     torch.manual_seed(42)
@@ -512,19 +530,18 @@ def train_supervised_embedding_model(cat_idx_array: np.ndarray,
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     ce_loss   = nn.CrossEntropyLoss()
-    ce_loss_noreduce = nn.CrossEntropyLoss(reduction='none')
+
+    if obs_mask is None:
+        obs_mask = np.ones_like(cat_idx_array, dtype=bool)
+    else:
+        obs_mask = np.array(obs_mask, dtype=bool)
+        assert obs_mask.shape == cat_idx_array.shape, \
+            'obs_mask harus sama shape dengan cat_idx_array'
 
     cat_tensor   = torch.tensor(cat_idx_array, dtype=torch.long, device=device)
     label_tensor = torch.tensor(labels, dtype=torch.long, device=device)
-
-    if mask_array is not None:
-        # observed_tensor: True = observed (bukan missing)
-        observed_tensor = torch.tensor(~np.array(mask_array, dtype=bool),
-                                       dtype=torch.bool, device=device)
-        dataset = torch.utils.data.TensorDataset(cat_tensor, label_tensor, observed_tensor)
-    else:
-        dataset = torch.utils.data.TensorDataset(cat_tensor, label_tensor)
-
+    mask_tensor  = torch.tensor(obs_mask, dtype=torch.bool, device=device)
+    dataset      = torch.utils.data.TensorDataset(cat_tensor, label_tensor, mask_tensor)
     cpu_gen      = torch.Generator(device='cpu')
     loader       = torch.utils.data.DataLoader(
         dataset,
@@ -549,37 +566,26 @@ def train_supervised_embedding_model(cat_idx_array: np.ndarray,
         total_recon_loss = 0.0
         n_batches        = 0
 
-        for batch in loader:
-            if mask_array is not None:
-                batch_cat, batch_labels, batch_observed = batch
-            else:
-                batch_cat, batch_labels = batch
-                batch_observed = None
-
+        for batch_cat, batch_labels, batch_obs in loader:
             optimizer.zero_grad()
 
             z, class_logits, recon_logits = model(batch_cat, add_noise=True)
 
             class_loss = ce_loss(class_logits, batch_labels)
 
-            if batch_observed is not None:
-                # [FIX - LEAKAGE] recon_loss hanya dihitung pada posisi
-                # OBSERVED (bukan missing) per kolom, per sample.
-                col_losses = []
-                for i in range(model.n_cols):
-                    obs_i = batch_observed[:, i]
-                    if obs_i.any():
-                        per_elem = ce_loss_noreduce(recon_logits[i], batch_cat[:, i])
-                        col_losses.append(per_elem[obs_i].mean())
-                if len(col_losses) > 0:
-                    recon_loss = sum(col_losses) / len(col_losses)
-                else:
-                    recon_loss = torch.tensor(0.0, device=device)
+            # [FIX LEAKAGE] Reconstruction loss hanya pada entri OBSERVED per kolom.
+            # Entri missing (sudah berupa token khusus di batch_cat) dilewati
+            # supaya tidak ada target yang berasal dari nilai yang seharusnya
+            # tidak diketahui, dan model tidak diajari mereproduksi token missing.
+            col_losses = []
+            for i in range(model.n_cols):
+                obs_i = batch_obs[:, i]
+                if obs_i.sum() > 0:
+                    col_losses.append(ce_loss(recon_logits[i][obs_i], batch_cat[obs_i, i]))
+            if len(col_losses) > 0:
+                recon_loss = sum(col_losses) / len(col_losses)
             else:
-                recon_loss = sum(
-                    ce_loss(recon_logits[i], batch_cat[:, i])
-                    for i in range(model.n_cols)
-                ) / model.n_cols
+                recon_loss = torch.zeros((), device=device)
 
             loss = alpha * class_loss + beta * recon_loss
 
@@ -668,11 +674,18 @@ def encode_with_embedding(model: SupervisedLearnableEmbeddingModel,
 def decode_cat_from_embedding(model: SupervisedLearnableEmbeddingModel,
                               emb_array: np.ndarray,
                               device: str,
-                              batch_size: int = 4096) -> np.ndarray:
+                              batch_size: int = 4096,
+                              n_valid_per_col: list = None) -> np.ndarray:
     """
     Decode embedding → prediksi kelas tiap kolom (argmax logits).
-    [TIDAK BERUBAH] — dipakai untuk kolom kategorikal (dan bisa juga untuk
-    numerik-bin jika diperlukan, tapi evaluasi numerik pakai bin_midpoints).
+    Dipakai untuk kolom kategorikal (dan bisa juga untuk numerik-bin jika
+    diperlukan, tapi evaluasi numerik pakai bin_midpoints via
+    decode_num_from_embedding).
+
+    n_valid_per_col : list[n_cols] of int, opsional — jumlah kategori "asli"
+        (TANPA token missing) per kolom. [FIX] Jika diberikan, logit untuk
+        token missing (selalu index terakhir) dibuang sebelum argmax, karena
+        token missing bukan jawaban valid untuk ground truth mana pun.
 
     emb_array : [N, total_emb_dim]
     Return    : [N, n_cols]  — predicted integer index
@@ -692,10 +705,12 @@ def decode_cat_from_embedding(model: SupervisedLearnableEmbeddingModel,
     with torch.no_grad():
         for (batch,) in loader:
             recon_logits = model.decode(batch)
-            pred_idx = torch.stack([
-                torch.argmax(logits, dim=1)
-                for logits in recon_logits
-            ], dim=1)
+            pred_cols = []
+            for i, logits in enumerate(recon_logits):
+                if n_valid_per_col is not None:
+                    logits = logits[:, :n_valid_per_col[i]]
+                pred_cols.append(torch.argmax(logits, dim=1))
+            pred_idx = torch.stack(pred_cols, dim=1)
             all_pred.append(pred_idx.cpu().numpy())
 
     return np.concatenate(all_pred, axis=0).astype(np.int64)
@@ -750,8 +765,13 @@ def decode_num_from_embedding(model: SupervisedLearnableEmbeddingModel,
 
             batch_num_preds = []
             for col in range(n_num_cols):
-                logits  = recon_logits[col]                          # [B, n_bins_col]
-                probs   = torch.softmax(logits, dim=1)               # [B, n_bins_col]
+                logits    = recon_logits[col]                        # [B, n_bins_col + 1] (+1 token missing)
+                n_bins_col = len(bin_midpoints[col])
+                # [FIX] Buang logit token "missing" (selalu index terakhir) —
+                # itu bukan jawaban valid untuk nilai numerik kontinu, dan
+                # softmax di-renormalisasi hanya atas n_bins asli.
+                logits_valid = logits[:, :n_bins_col]                 # [B, n_bins_col]
+                probs   = torch.softmax(logits_valid, dim=1)          # [B, n_bins_col]
                 mids_t  = torch.tensor(
                     bin_midpoints[col], dtype=torch.float32, device=device
                 )                                                     # [n_bins_col]
@@ -862,7 +882,8 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     n_num_cols = len(num_col_idx)
 
     if n_num_cols > 0:
-        num_mask_train = train_mask[:, num_col_idx].astype(bool)
+        num_mask_train = train_mask[:, num_col_idx].astype(bool)   # True = MISSING
+        num_mask_test  = test_mask[:,  num_col_idx].astype(bool)
         mask_obs       = (~num_mask_train).astype(np.float32)
         mask_sum       = mask_obs.sum(0)
         mask_sum[mask_sum == 0] = 1.0
@@ -892,13 +913,13 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
             t_mrmd = 0.0
             print(f'[MRmD] Cut points di-load. n_bins per kolom: {mrmd.n_bins_}')
         else:
-            # Fit MRmD pada data RAW train (bukan normalisasi) dengan label
+            # [FIX LEAKAGE] Fit MRmD pada data RAW train, TAPI hanya dari entri
+            # OBSERVED (num_mask_train diteruskan sebagai filter). Entri yang
+            # ditandai missing tidak pernah ikut menentukan cut point.
             print(f'[MRmD] Cache belum ada. Menjalankan MRmD discretization '
-                  f'pada {n_num_cols} kolom numerik ...')
+                  f'(observed-only) pada {n_num_cols} kolom numerik ...')
             t_mrmd_start = time.time()
             mrmd = MRmDDiscretizer(val_size=0.125, N_D=50, random_state=42, verbose=False)
-            # [FIX - LEAKAGE] Sertakan num_mask_train agar MRmD hanya fit
-            # pada nilai yang OBSERVED, bukan posisi yang di-mask missing.
             mrmd.fit(train_num_raw, train_labels, mask=num_mask_train)
             t_mrmd = time.time() - t_mrmd_start
 
@@ -908,31 +929,53 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
             print(f'[MRmD] Cache disimpan ke {mrmd_cache_path}')
             print(f'[MRmD] Waktu komputasi diskritisasi: {t_mrmd:.4f}s')
 
-        # Transform train & test pakai cut points yang sama (fit atau cache)
-        train_num_bin = mrmd.transform(train_num_raw)   # [N_train, n_num_cols] int64
-        test_num_bin  = mrmd.transform(test_num_raw)    # [N_test,  n_num_cols] int64
+        # Bin index "TRUE" (nilai asli) — dipakai HANYA sebagai ground truth
+        # evaluasi (truth_all_idx) & untuk hitung bin_midpoints, TIDAK dipakai
+        # langsung sebagai input embedding.
+        train_num_bin_true = mrmd.transform(train_num_raw)   # [N_train, n_num_cols] int64
+        test_num_bin_true  = mrmd.transform(test_num_raw)    # [N_test,  n_num_cols] int64
 
-        # Hitung bin midpoints dalam skala NORMALISASI
+        # Hitung bin midpoints dalam skala NORMALISASI, HANYA dari entri observed
         # (dipakai saat decoding: bin index → nilai kontinu untuk MAE/RMSE)
-        bin_midpoints = mrmd.get_bin_midpoints(train_num_norm, train_num_bin)
+        bin_midpoints = mrmd.get_bin_midpoints(train_num_norm, train_num_bin_true,
+                                               mask=num_mask_train)
 
-        print(f'[MRmD] n_bins per kolom: {mrmd.n_bins_}')
+        # [FIX LEAKAGE] Token "missing" khusus per kolom numerik = index terakhir
+        # (di luar rentang bin asli 0..n_bins-1). Dipakai menggantikan nilai asli
+        # di posisi missing SEBELUM masuk ke embedding model.
+        num_missing_token = np.array(mrmd.n_bins_, dtype=np.int64)
+
+        train_num_bin_input = train_num_bin_true.copy()
+        test_num_bin_input  = test_num_bin_true.copy()
+        for j in range(n_num_cols):
+            train_num_bin_input[num_mask_train[:, j], j] = num_missing_token[j]
+            test_num_bin_input[num_mask_test[:, j],  j] = num_missing_token[j]
+
+        print(f'[MRmD] n_bins per kolom (fit observed-only): {mrmd.n_bins_}')
         print(f'[MRmD] Total bins: {sum(mrmd.n_bins_)}')
 
     else:
         # Tidak ada fitur numerik
-        train_num     = np.zeros((len(train_df), 0), dtype=np.float32)
-        test_num      = np.zeros((len(test_df),  0), dtype=np.float32)
-        train_num_bin = np.zeros((len(train_df), 0), dtype=np.int64)
-        test_num_bin  = np.zeros((len(test_df),  0), dtype=np.int64)
-        bin_midpoints = []
-        mrmd          = None
-        t_mrmd        = 0.0
+        train_num           = np.zeros((len(train_df), 0), dtype=np.float32)
+        test_num            = np.zeros((len(test_df),  0), dtype=np.float32)
+        train_num_bin_true  = np.zeros((len(train_df), 0), dtype=np.int64)
+        test_num_bin_true   = np.zeros((len(test_df),  0), dtype=np.int64)
+        train_num_bin_input = np.zeros((len(train_df), 0), dtype=np.int64)
+        test_num_bin_input  = np.zeros((len(test_df),  0), dtype=np.int64)
+        num_mask_train      = np.zeros((len(train_df), 0), dtype=bool)
+        num_mask_test       = np.zeros((len(test_df),  0), dtype=bool)
+        num_missing_token   = np.array([], dtype=np.int64)
+        bin_midpoints       = []
+        mrmd                = None
+        t_mrmd              = 0.0
 
     # ── Encoding kolom kategorikal ────────────────────────────────────────
-    cat_dims_cat           = []
-    train_cat_idx_list     = []
-    test_cat_idx_list      = []
+    # Catatan: vocab LabelEncoder di-fit dari data_df (daftar kategori yang
+    # ada) — ini bukan leakage nilai (cuma mendefinisikan kamus kategori,
+    # bukan memakai nilai spesifik yang missing sebagai sinyal training).
+    cat_dims_cat            = []
+    train_cat_idx_true_list = []
+    test_cat_idx_true_list  = []
 
     if len(cat_col_idx) > 0:
         cat_columns = cols[cat_col_idx]
@@ -940,79 +983,104 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
         train_cat   = train_df[cat_columns].astype(str)
         test_cat    = test_df[cat_columns].astype(str)
 
+        cat_mask_train = train_mask[:, cat_col_idx].astype(bool)   # True = MISSING
+        cat_mask_test  = test_mask[:,  cat_col_idx].astype(bool)
+
         encoders = {}
         for col in cat_columns:
             le = LabelEncoder()
             le.fit(data_cat[col])
             encoders[col] = le
             cat_dims_cat.append(len(le.classes_))
-            train_cat_idx_list.append(
+            train_cat_idx_true_list.append(
                 le.transform(train_cat[col]).astype(np.int64)
             )
-            test_cat_idx_list.append(
+            test_cat_idx_true_list.append(
                 le.transform(test_cat[col]).astype(np.int64)
             )
 
-        train_cat_idx = np.stack(train_cat_idx_list, axis=1)
-        test_cat_idx  = np.stack(test_cat_idx_list,  axis=1)
-    else:
-        train_cat_idx = np.zeros((len(train_df), 0), dtype=np.int64)
-        test_cat_idx  = np.zeros((len(test_df),  0), dtype=np.int64)
+        train_cat_idx_true = np.stack(train_cat_idx_true_list, axis=1)
+        test_cat_idx_true  = np.stack(test_cat_idx_true_list,  axis=1)
 
-    # ── Gabungkan: [num_bin | cat_idx] → satu array idx untuk embedding ──
-    # Urutan: numerik (bin) DULU, lalu kategorikal — konsisten di seluruh pipeline
-    if n_num_cols > 0 and len(cat_col_idx) > 0:
-        train_all_idx = np.concatenate([train_num_bin, train_cat_idx], axis=1)
-        test_all_idx  = np.concatenate([test_num_bin,  test_cat_idx],  axis=1)
-    elif n_num_cols > 0:
-        train_all_idx = train_num_bin
-        test_all_idx  = test_num_bin
+        # [FIX LEAKAGE] Token "missing" khusus per kolom kategorikal = index
+        # terakhir (di luar rentang kategori asli). Gantikan nilai asli di
+        # posisi missing SEBELUM masuk ke embedding model.
+        cat_missing_token = np.array(cat_dims_cat, dtype=np.int64)
+
+        train_cat_idx_input = train_cat_idx_true.copy()
+        test_cat_idx_input  = test_cat_idx_true.copy()
+        for j in range(len(cat_col_idx)):
+            train_cat_idx_input[cat_mask_train[:, j], j] = cat_missing_token[j]
+            test_cat_idx_input[cat_mask_test[:, j],  j] = cat_missing_token[j]
     else:
-        train_all_idx = train_cat_idx
-        test_all_idx  = test_cat_idx
+        train_cat_idx_true  = np.zeros((len(train_df), 0), dtype=np.int64)
+        test_cat_idx_true   = np.zeros((len(test_df),  0), dtype=np.int64)
+        train_cat_idx_input = np.zeros((len(train_df), 0), dtype=np.int64)
+        test_cat_idx_input  = np.zeros((len(test_df),  0), dtype=np.int64)
+        cat_mask_train      = np.zeros((len(train_df), 0), dtype=bool)
+        cat_mask_test       = np.zeros((len(test_df),  0), dtype=bool)
+        cat_missing_token   = np.array([], dtype=np.int64)
+
+    # ── Gabungkan: [num_bin | cat_idx] → satu array idx ─────────────────
+    # Urutan: numerik (bin) DULU, lalu kategorikal — konsisten di seluruh pipeline
+    # "true"  = nilai asli, dipakai HANYA sebagai ground truth evaluasi (get_eval)
+    # "input" = versi dengan token missing, dipakai sebagai input embedding
+    #           model (training & encode) — TIDAK PERNAH ada nilai asli di
+    #           posisi missing yang masuk ke sini. Ini yang memutus leakage.
+    if n_num_cols > 0 and len(cat_col_idx) > 0:
+        train_all_idx_true  = np.concatenate([train_num_bin_true,  train_cat_idx_true],  axis=1)
+        test_all_idx_true   = np.concatenate([test_num_bin_true,   test_cat_idx_true],   axis=1)
+        train_all_idx_input = np.concatenate([train_num_bin_input, train_cat_idx_input], axis=1)
+        test_all_idx_input  = np.concatenate([test_num_bin_input,  test_cat_idx_input],  axis=1)
+    elif n_num_cols > 0:
+        train_all_idx_true  = train_num_bin_true
+        test_all_idx_true   = test_num_bin_true
+        train_all_idx_input = train_num_bin_input
+        test_all_idx_input  = test_num_bin_input
+    else:
+        train_all_idx_true  = train_cat_idx_true
+        test_all_idx_true   = test_cat_idx_true
+        train_all_idx_input = train_cat_idx_input
+        test_all_idx_input  = test_cat_idx_input
 
     # ── Dimensi embedding ─────────────────────────────────────────────────
-    # Numerik: n_bins per kolom; kategorikal: n_unique per kolom
-    all_dims = (mrmd.n_bins_ if mrmd is not None else []) + cat_dims_cat
-    emb_sizes = [compute_embedding_size(n) for n in all_dims]
+    # Numerik: n_bins per kolom; kategorikal: n_unique per kolom.
+    # [FIX LEAKAGE] +1 per kolom untuk token "missing" khusus (num_embeddings
+    # harus cukup menampung index token missing yang baru saja ditambahkan).
+    all_dims_true = (mrmd.n_bins_ if mrmd is not None else []) + cat_dims_cat
+    all_dims      = [d + 1 for d in all_dims_true]
+    emb_sizes     = [compute_embedding_size(n) for n in all_dims]
 
-    print(f'[Embedding] all_dims (num_bin+cat)={all_dims}')
+    print(f'[Embedding] all_dims_true (num_bin+cat, tanpa token missing)={all_dims_true}')
+    print(f'[Embedding] all_dims (+1 token missing per kolom)={all_dims}')
     print(f'[Embedding] emb_sizes={emb_sizes}, total_emb_dim={sum(emb_sizes)}')
+
+    # obs_mask: True = observed, dipakai buat masking reconstruction loss
+    if n_num_cols > 0 and len(cat_col_idx) > 0:
+        train_obs_mask = ~np.concatenate([num_mask_train, cat_mask_train], axis=1)
+    elif n_num_cols > 0:
+        train_obs_mask = ~num_mask_train
+    else:
+        train_obs_mask = ~cat_mask_train
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # ── Mask level-kolom [num_mask | cat_mask] ─────────────────────────────
-    # [FIX - LEAKAGE] Dihitung DI SINI (sebelum training embedding) agar bisa
-    # dipakai untuk mengecualikan posisi missing dari training embedding.
-    # Urutan kolom sama dengan all_dims / train_all_idx: numerik dulu, lalu kategorikal.
-    train_num_mask = train_mask[:, num_col_idx].astype(bool) if n_num_cols > 0 else np.zeros((len(train_df), 0), dtype=bool)
-    train_cat_mask = train_mask[:, cat_col_idx].astype(bool) if len(cat_col_idx) > 0 else np.zeros((len(train_df), 0), dtype=bool)
-    test_num_mask  = test_mask[:, num_col_idx].astype(bool)  if n_num_cols > 0 else np.zeros((len(test_df),  0), dtype=bool)
-    test_cat_mask  = test_mask[:, cat_col_idx].astype(bool)  if len(cat_col_idx) > 0 else np.zeros((len(test_df),  0), dtype=bool)
-
-    if n_num_cols > 0 and len(cat_col_idx) > 0:
-        train_all_mask = np.concatenate([train_num_mask, train_cat_mask], axis=1)
-        test_all_mask  = np.concatenate([test_num_mask,  test_cat_mask],  axis=1)
-    elif n_num_cols > 0:
-        train_all_mask = train_num_mask
-        test_all_mask  = test_num_mask
-    else:
-        train_all_mask = train_cat_mask
-        test_all_mask  = test_cat_mask
-
     # ── Latih SupervisedLearnableEmbeddingModel ───────────────────────────
-    # Input: semua kolom (numerik bin + kategorikal) sebagai integer index
+    # [FIX LEAKAGE] Input training = train_all_idx_input (token missing di
+    # posisi yang ditandai missing, BUKAN train_all_idx_true). Reconstruction
+    # loss dibatasi ke entri observed lewat obs_mask.
     print('[Embedding] Melatih SupervisedLearnableEmbeddingModel '
-          '(classification + reconstruction loss) ...')
+          '(classification + reconstruction loss, observed-only) ...')
     t_emb_start = time.time()
     print(noise_std)
     emb_model = train_supervised_embedding_model(
-        cat_idx_array = train_all_idx,
+        cat_idx_array = train_all_idx_input,
         labels        = train_labels,
         cat_dims      = all_dims,
         emb_sizes     = emb_sizes,
         n_classes     = n_classes,
         device        = device,
+        obs_mask      = train_obs_mask,
         n_epochs      = 1000,
         batch_size    = 1024,
         lr            = 1e-3,
@@ -1022,7 +1090,6 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
         mlp_ratio     = 1.5,
         noise_std     = noise_std,
         patience      = 40,
-        mask_array    = train_all_mask,   # [FIX - LEAKAGE] posisi missing dikecualikan dari recon loss
     )
     t_emb_end = time.time()
     t_emb = t_emb_end - t_emb_start
@@ -1030,9 +1097,12 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     print(f'[Embedding] Waktu komputasi embedding: {t_emb:.4f}s')
 
     # ── Encode semua kolom → embedding vector ────────────────────────────
-    # [TIDAK BERUBAH] — encode_with_embedding sama persis
-    train_all_emb = encode_with_embedding(emb_model, train_all_idx, device)
-    test_all_emb  = encode_with_embedding(emb_model, test_all_idx,  device)
+    # [FIX LEAKAGE] Encode dari train_all_idx_input / test_all_idx_input
+    # (dengan token missing), BUKAN dari versi _true. train_X/test_X yang
+    # dipakai tahap berikutnya (mis. diffusion) tidak pernah "tahu" nilai
+    # asli di posisi missing.
+    train_all_emb = encode_with_embedding(emb_model, train_all_idx_input, device)
+    test_all_emb  = encode_with_embedding(emb_model, test_all_idx_input,  device)
     # shape: [N, total_emb_dim]
 
     # ── train_X / test_X sekarang HANYA embedding (tidak ada kolom raw num) ─
@@ -1043,8 +1113,22 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     # ── Buat extended mask ────────────────────────────────────────────────
     # Mask asli: [N, total_original_cols]
     # Extended mask: [N, total_emb_dim] — diperluas sesuai emb_sizes
-    # (train_num_mask, train_cat_mask, train_all_mask, dst. sudah dihitung
-    #  di atas, sebelum training embedding — lihat blok [FIX - LEAKAGE])
+    # (reuse mask yang sudah dihitung di atas — num_mask_train/test, cat_mask_train/test)
+    train_num_mask = num_mask_train
+    train_cat_mask = cat_mask_train
+    test_num_mask  = num_mask_test
+    test_cat_mask  = cat_mask_test
+
+    # Gabungkan mask: [num_mask | cat_mask] — urutan sama dengan all_dims
+    if n_num_cols > 0 and len(cat_col_idx) > 0:
+        train_all_mask = np.concatenate([train_num_mask, train_cat_mask], axis=1)
+        test_all_mask  = np.concatenate([test_num_mask,  test_cat_mask],  axis=1)
+    elif n_num_cols > 0:
+        train_all_mask = train_num_mask
+        test_all_mask  = test_num_mask
+    else:
+        train_all_mask = train_cat_mask
+        test_all_mask  = test_cat_mask
 
     emb_sizes_arr = np.array(emb_sizes, dtype=int)
 
@@ -1071,7 +1155,7 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     return (train_X, test_X,
             train_mask, test_mask,
             train_num, test_num,
-            train_all_idx, test_all_idx,
+            train_all_idx_true, test_all_idx_true,   # ground truth (bin/label asli) utk evaluasi
             extend_train_mask, extend_test_mask,
             None,          # cat_bin_num (legacy)
             emb_model,
@@ -1101,7 +1185,7 @@ def get_eval(dataname, X_recon, X_true, truth_all_idx,
              num_num, emb_model, emb_sizes, mask,
              device='cpu', oos=False,
              bin_midpoints=None, n_num_cols=0,
-             num_true_norm=None):
+             num_true_norm=None, cat_dims_true=None):
     """
     Hitung MAE, RMSE (numerik) dan Accuracy (kategorikal).
 
@@ -1196,7 +1280,9 @@ def get_eval(dataname, X_recon, X_true, truth_all_idx,
         rmse = float(np.sqrt((diff ** 2).mean()))
 
     # ── Kategorikal: Akurasi via Linear Decoder ───────────────────────────
-    # [TIDAK BERUBAH] — logika sama, hanya offset kolom bergeser
+    # Logika sama seperti sebelumnya, hanya offset kolom bergeser.
+    # [FIX] cat_dims_true (kalau dipass) dipakai untuk buang logit token
+    # "missing" dari argmax — token itu bukan jawaban valid untuk truth mana pun.
     acc = np.nan
     if (truth_all_idx is not None
             and len(cat_col_idx) > 0
@@ -1206,7 +1292,7 @@ def get_eval(dataname, X_recon, X_true, truth_all_idx,
 
         # Decode semua kolom → predicted index
         pred_all_idx = decode_cat_from_embedding(
-            emb_model, X_recon, device
+            emb_model, X_recon, device, n_valid_per_col=cat_dims_true
         )  # [N, n_num_cols + n_cat_cols]
 
         # Kolom kategorikal berada di offset n_num_cols (setelah numerik)
