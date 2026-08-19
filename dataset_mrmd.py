@@ -910,13 +910,38 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
     train_y = train_df[cols[target_col_idx]]
     test_y  = test_df[cols[target_col_idx]]
 
+    # [FIX - LEAKAGE] LabelEncoder untuk target HANYA di-fit pada train_y,
+    # bukan gabungan train+test. Fit pada data gabungan berarti informasi
+    # test set (kelas apa saja yang ada di test) ikut "dilihat" saat
+    # menyiapkan preprocessing untuk train — itu train/test leakage.
+    #
+    # Jika ada nilai target di test yang TIDAK muncul di train, nilai
+    # tersebut dipetakan ke bucket khusus 'unknown' (index = n_classes)
+    # alih-alih menyebabkan error atau diam-diam "mengintip" test.
     label_encoder = LabelEncoder()
-    all_labels    = pd.concat([train_y, test_y]).values.ravel()
-    label_encoder.fit(all_labels.astype(str))
+    label_encoder.fit(train_y.values.ravel().astype(str))
+    n_classes = len(label_encoder.classes_)
+    known_label_classes = set(label_encoder.classes_)
+
+    def _safe_label_transform(series, encoder, known_classes, unknown_idx):
+        vals = series.values.ravel().astype(str)
+        out  = np.empty(len(vals), dtype=np.int64)
+        unknown_count = 0
+        for i, v in enumerate(vals):
+            if v in known_classes:
+                out[i] = encoder.transform([v])[0]
+            else:
+                out[i] = unknown_idx
+                unknown_count += 1
+        return out, unknown_count
 
     train_labels = label_encoder.transform(train_y.values.ravel().astype(str))
-    test_labels  = label_encoder.transform(test_y.values.ravel().astype(str))
-    n_classes    = len(label_encoder.classes_)
+    test_labels, n_unknown_test_labels = _safe_label_transform(
+        test_y, label_encoder, known_label_classes, unknown_idx=n_classes
+    )
+    if n_unknown_test_labels > 0:
+        print(f'[Dataset] PERINGATAN: {n_unknown_test_labels} label target di '
+              f'test tidak muncul di train, dipetakan ke bucket "unknown".')
 
     print(f'[Dataset] Detected {n_classes} classes for supervised learning')
     print(f'[Dataset] Classes: {label_encoder.classes_}')
@@ -1005,22 +1030,51 @@ def load_dataset(dataname, idx=0, mask_type='MCAR', ratio='30', noise_std=0.01):
 
     if len(cat_col_idx) > 0:
         cat_columns = cols[cat_col_idx]
-        data_cat    = data_df[cat_columns].astype(str)
         train_cat   = train_df[cat_columns].astype(str)
         test_cat    = test_df[cat_columns].astype(str)
 
+        # [FIX - LEAKAGE] LabelEncoder per kolom kategorikal SEKARANG
+        # HANYA di-fit pada train_cat, bukan data_df (gabungan train+test).
+        # Fit pada gabungan train+test berarti vocabulary kategori dibangun
+        # dengan "mengintip" nilai-nilai yang ada di test set — itu
+        # train/test leakage.
+        #
+        # Konsekuensinya: kalau ada kategori di test yang TIDAK pernah
+        # muncul di train, kategori tsb dipetakan ke 1 bucket khusus
+        # 'unknown' (index terakhir = n_kategori_train) alih-alih error.
+        # Ini juga konsisten dengan pola token 'missing' yang sudah ada di
+        # train_supervised_embedding_model — sama-sama menambah 1 slot
+        # embedding ekstra per kolom untuk kasus "nilai tak dikenal".
         encoders = {}
         for col in cat_columns:
             le = LabelEncoder()
-            le.fit(data_cat[col])
+            le.fit(train_cat[col])
             encoders[col] = le
-            cat_dims_cat.append(len(le.classes_))
-            train_cat_idx_list.append(
-                le.transform(train_cat[col]).astype(np.int64)
-            )
-            test_cat_idx_list.append(
-                le.transform(test_cat[col]).astype(np.int64)
-            )
+
+            known_classes = set(le.classes_)
+            unknown_idx   = len(le.classes_)
+            # +1 slot untuk bucket 'unknown' (kategori test yang tak
+            # muncul di train)
+            cat_dims_cat.append(len(le.classes_) + 1)
+
+            train_idx_col = le.transform(train_cat[col]).astype(np.int64)
+
+            test_vals   = test_cat[col].values
+            test_idx_col = np.empty(len(test_vals), dtype=np.int64)
+            n_unknown   = 0
+            for i, v in enumerate(test_vals):
+                if v in known_classes:
+                    test_idx_col[i] = le.transform([v])[0]
+                else:
+                    test_idx_col[i] = unknown_idx
+                    n_unknown += 1
+            if n_unknown > 0:
+                print(f'[Dataset] PERINGATAN: kolom "{col}" — {n_unknown} '
+                      f'nilai di test tidak muncul di train, dipetakan ke '
+                      f'bucket "unknown".')
+
+            train_cat_idx_list.append(train_idx_col)
+            test_cat_idx_list.append(test_idx_col)
 
         train_cat_idx = np.stack(train_cat_idx_list, axis=1)
         test_cat_idx  = np.stack(test_cat_idx_list,  axis=1)
